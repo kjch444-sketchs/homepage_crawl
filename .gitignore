@@ -1,0 +1,5 @@
+report/
+mvno_partial_*.xlsx
+mvno_combined_plans_20*.xlsx
+__pycache__/
+*.log
