@@ -1,5 +1,9 @@
 name: MVNO 요금제 수집 및 알림
 
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
+
 on:
   workflow_dispatch:
   schedule:
