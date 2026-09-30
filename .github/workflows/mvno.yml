@@ -1,0 +1,88 @@
+name: MVNO 요금제 수집 및 알림
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 한국 시간: 09:17, 13:17, 18:17 (원하는 시각으로 변경)
+    - cron: '17 9,13,18 * * *'
+      timezone: 'Asia/Seoul'
+
+concurrency:
+  group: mvno-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 의존성 설치
+        run: python -m pip install playwright openpyxl
+
+      - name: 한국 시간 실행 ID 설정
+        shell: pwsh
+        run: |
+          $kst = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([datetime]::UtcNow, 'Korea Standard Time')
+          "RUN_STAMP=$($kst.ToString('yyyyMMdd_HHmmss'))" >> $env:GITHUB_ENV
+          "RUN_DATE=$($kst.ToString('yyyy-MM-dd'))" >> $env:GITHUB_ENV
+
+      - name: 이전 정상 결과와 비교하여 수집
+        shell: pwsh
+        run: |
+          $output = "report/mvno_combined_plans_${env:RUN_STAMP}_${env:GITHUB_RUN_ID}_${env:GITHUB_RUN_ATTEMPT}.xlsx"
+          "REPORT_PATH=$output" >> $env:GITHUB_ENV
+          $crawlArgs = @('mvno_combined_edge_v38.py', '--date', $env:RUN_DATE, '--output', $output)
+          if (Test-Path 'history/latest.xlsx') {
+            $crawlArgs += @('--previous', 'history/latest.xlsx')
+          }
+          python @crawlArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 실행별 원본과 이력 집계 저장
+        shell: pwsh
+        run: |
+          $runId = "${env:GITHUB_RUN_ID}_${env:GITHUB_RUN_ATTEMPT}"
+          $runUrl = "${env:GITHUB_SERVER_URL}/${env:GITHUB_REPOSITORY}/actions/runs/${env:GITHUB_RUN_ID}"
+          python mvno_history.py $env:REPORT_PATH --stamp $env:RUN_STAMP --run-id $runId --run-url $runUrl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 실행 결과 백업
+        uses: actions/upload-artifact@v4
+        with:
+          name: mvno-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 이력을 저장소에 반영
+        shell: pwsh
+        env:
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- history
+          git commit -m "MVNO 요금제 실행 이력 ${env:RUN_STAMP} (${env:GITHUB_RUN_ID})"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git push origin "HEAD:${env:TARGET_BRANCH}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 메일 첨부 및 텔레그램 가이드위반 발송
+        shell: pwsh
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MVNO_MAIL_TO: ${{ secrets.MVNO_MAIL_TO }}
+          MVNO_TELEGRAM_BOT_TOKEN: ${{ secrets.MVNO_TELEGRAM_BOT_TOKEN }}
+          MVNO_TELEGRAM_CHAT_ID: ${{ secrets.MVNO_TELEGRAM_CHAT_ID }}
+        run: |
+          python mvno_notify.py $env:REPORT_PATH
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
