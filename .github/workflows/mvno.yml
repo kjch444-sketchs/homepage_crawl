@@ -1,5 +1,6 @@
 name: MVNO 요금제 수집 및 알림
 
+# Windows 러너의 기본 콘솔 인코딩(cp1252)에서 한글 로그가 깨지는 문제 방지.
 env:
   PYTHONIOENCODING: utf-8
   PYTHONUTF8: '1'
@@ -43,12 +44,21 @@ jobs:
         run: |
           $output = "report/mvno_combined_plans_${env:RUN_STAMP}_${env:GITHUB_RUN_ID}_${env:GITHUB_RUN_ATTEMPT}.xlsx"
           "REPORT_PATH=$output" >> $env:GITHUB_ENV
-          $crawlArgs = @('mvno_combined_edge_v38.py', '--date', $env:RUN_DATE, '--output', $output)
+          $crawlArgs = @('mvno_combined_edge_v40.py', '--date', $env:RUN_DATE, '--output', $output)
           if (Test-Path 'history/latest.xlsx') {
             $crawlArgs += @('--previous', 'history/latest.xlsx')
           }
           python @crawlArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 수집 실패 시 부분 결과 보관 (정상 이력에는 포함하지 않음)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mvno-partial-${{ github.run_id }}-${{ github.run_attempt }}
+          path: mvno_partial_*.xlsx
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: 실행별 원본과 이력 집계 저장
         shell: pwsh
