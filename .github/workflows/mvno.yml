@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
   schedule:
     # 한국 시간: 09:17, 13:17, 18:17 (원하는 시각으로 변경)
-    - cron: '17 7,10,13,18 * * *'
+    - cron: '17 9,13,18 * * *'
       timezone: 'Asia/Seoul'
 
 concurrency:
@@ -44,7 +44,7 @@ jobs:
         run: |
           $output = "report/mvno_combined_plans_${env:RUN_STAMP}_${env:GITHUB_RUN_ID}_${env:GITHUB_RUN_ATTEMPT}.xlsx"
           "REPORT_PATH=$output" >> $env:GITHUB_ENV
-          $crawlArgs = @('mvno_combined_edge_v45.py', '--date', $env:RUN_DATE, '--output', $output)
+          $crawlArgs = @('mvno_combined_edge_v49.py', '--date', $env:RUN_DATE, '--output', $output)
           if (Test-Path 'history/latest.xlsx') {
             $crawlArgs += @('--previous', 'history/latest.xlsx')
           }
