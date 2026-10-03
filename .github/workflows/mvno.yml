@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
   schedule:
     # 한국 시간: 매일 07:07, 21:07
-    - cron: '07 7,21 * * *'
+    - cron: '07 6,19 * * *'
       timezone: 'Asia/Seoul'
 
 concurrency:
