@@ -4,8 +4,9 @@ import re
 import html
 import json
 import argparse
+import os
 from collections import Counter, defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import PatternFill
@@ -429,6 +430,36 @@ def kg_allowance(value, unit):
     return normalize_units(f"{value}{unit}")
 
 
+def kg_diagnostic_path():
+    """현재 GitHub Actions 실행별 KG 진단 로그 경로를 반환한다."""
+    stamp = os.environ.get("RUN_STAMP") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = os.environ.get("GITHUB_RUN_ID", "local")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
+    return Path(__file__).with_name(f"mvno_kg_diagnostics_{stamp}_{run_id}_{attempt}.jsonl")
+
+
+def log_kg_diagnostic(plan_no, stage, error, summary=None, detail=None):
+    """문제가 발생한 KG 요금제의 원본 응답과 오류를 JSONL 파일로 보존한다."""
+    path = kg_diagnostic_path()
+    record = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "planNo": plan_no,
+        "stage": stage,
+        "error_type": type(error).__name__ if isinstance(error, Exception) else "Error",
+        "error": str(error),
+        "summary": summary,
+        "detail": detail,
+    }
+    try:
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        print(f"KG 진단 로그 저장: {path.name}")
+    except Exception as log_error:
+        # 진단 파일 저장 실패가 크롤링 전체를 중단시키지는 않게 한다.
+        print(f"⚠️ KG 진단 로그 파일 저장 실패: {log_error}")
+        print("KG 진단 정보:", json.dumps(record, ensure_ascii=False, default=str))
+
+
 def kg_row(plan):
     description = kg_text(plan.get("contents"))
     lifetime = "할인기간 제한이 없는 평생 할인 요금제" in description
@@ -494,30 +525,68 @@ def kg_browser_json(page, path):
 
 
 def crawl_kg(page):
-    # 화면의 1, 2, 3... 페이지는 이 목록 API의 결과를 15개씩 잘라 보여준다.
-    # 각 요금제 상세 페이지가 호출하는 상세 API를 개별 조회한다.
+    # 목록 API 자체가 실패하면 호출부에서 KG 사업자만 제외하고 나머지 사업자는 계속 수집한다.
+    # 개별 요금제 상세/API/가격 검증 오류는 해당 요금제만 제외하고 다음 요금제로 진행한다.
     page.goto(KG_URL, wait_until="domcontentloaded", timeout=60000)
-    payload = kg_browser_json(page,
-        "/api/product/plan?page=1&limit=-1&block=5&isUser=true&useFlag=Y")
+    payload = kg_browser_json(
+        page, "/api/product/plan?page=1&limit=-1&block=5&isUser=true&useFlag=Y"
+    )
     entity = payload.get("entity") or {}
     plans = entity.get("list") or []
     expected = (entity.get("pageInfo") or {}).get("totalRow")
     if not plans or expected is None or len(plans) != int(expected):
         raise RuntimeError(f"KG 목록 건수 불일치: 조회 {len(plans)}, 전체 {expected}")
-    print(f"KG모바일 목록: {len(plans)}건 (상세 페이지별 조회 시작)")
 
+    print(f"KG모바일 목록: {len(plans)}건 (상세 페이지별 조회 시작)")
     rows = []
+    failed = 0
+
     for index, summary in enumerate(plans, 1):
-        plan_no = summary["planNo"]
-        detail_payload = kg_browser_json(page, f"/api/product/plan/{plan_no}")
-        if not detail_payload.get("entity"):
-            raise RuntimeError(f"KG 상세 응답 오류: {plan_no}")
-        detail = detail_payload["entity"]
-        if detail.get("planNo") != plan_no:
-            raise RuntimeError(f"KG 상세 요금제 번호 불일치: {plan_no}")
-        rows.append(kg_row(detail))
+        plan_no = summary.get("planNo")
+        detail = None
+        stage = "상세 API 조회"
+        try:
+            if plan_no in (None, ""):
+                raise ValueError("목록 항목에 planNo가 없습니다")
+
+            detail_payload = kg_browser_json(page, f"/api/product/plan/{plan_no}")
+            detail = detail_payload.get("entity")
+            if not detail:
+                raise RuntimeError(f"KG 상세 응답에 entity가 없습니다: {plan_no}")
+            if str(detail.get("planNo")) != str(plan_no):
+                raise RuntimeError(
+                    f"KG 상세 요금제 번호 불일치: 목록={plan_no}, 상세={detail.get('planNo')}"
+                )
+
+            stage = "요금/할인 데이터 검증"
+            row = kg_row(detail)
+            rows.append(row)
+
+        except Exception as exc:
+            failed += 1
+            log_kg_diagnostic(
+                plan_no=plan_no,
+                stage=stage,
+                error=exc,
+                summary=summary,
+                detail=detail,
+            )
+            print(
+                f"⚠️ KG모바일 {index}/{len(plans)} 요금제 제외: "
+                f"planNo={plan_no}, {type(exc).__name__}: {exc}"
+            )
+            # 가격을 안전하게 계산할 수 없는 요금제는 잘못된 가격으로 저장하지 않고 건너뛴다.
+            continue
+
         if index % 15 == 0 or index == len(plans):
-            print(f"KG모바일 상세 추출: {index}/{len(plans)}건")
+            print(
+                f"KG모바일 진행: {index}/{len(plans)}건 확인, "
+                f"정상 {len(rows)}건 / 제외 {failed}건"
+            )
+
+    print(f"KG모바일 상세 추출 완료: 정상 {len(rows)}건, 제외 {failed}건")
+    if failed:
+        print(f"⚠️ 제외된 KG 요금제의 상세 진단은 {kg_diagnostic_path().name} 파일에 저장했습니다.")
     return rows
 
 
@@ -1275,7 +1344,21 @@ def crawl_all():
             rows.extend(crawl_sugar(page))
             rows.extend(crawl_siwol(page))
             rows.extend(crawl_eyagi(page))
-            rows.extend(crawl_kg(page))
+            try:
+                rows.extend(crawl_kg(page))
+            except Exception as exc:
+                # KG 목록 API/접속 자체가 실패해도 다른 통신사 수집은 계속한다.
+                log_kg_diagnostic(
+                    plan_no=None,
+                    stage="KG 목록/API 전체",
+                    error=exc,
+                    summary=None,
+                    detail=None,
+                )
+                print(
+                    f"⚠️ KG모바일 수집 단계 실패. KG는 제외하고 다음 사업자로 진행합니다: "
+                    f"{type(exc).__name__}: {exc}"
+                )
             # 이지모바일은 GitHub 호스팅 러너에서 두 호스트 모두 연결 시간 초과되어 제외.
             crawl_eyes(page, rows)
             rows.extend(crawl_chance(page))
