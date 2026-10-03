@@ -60,6 +60,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: KG 요금제 오류 진단 로그 보관
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mvno-kg-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: mvno_kg_diagnostics_*.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: 실행별 원본과 이력 집계 저장
         shell: pwsh
         run: |
