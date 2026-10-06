@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
   schedule:
     # 한국 시간: 매일 07:07, 21:07
-    - cron: '37 4,16 * * *'
+    - cron: '7 7,21 * * *'
       timezone: 'Asia/Seoul'
 
 concurrency:
@@ -44,7 +44,7 @@ jobs:
         run: |
           $output = "report/mvno_combined_plans_${env:RUN_STAMP}_${env:GITHUB_RUN_ID}_${env:GITHUB_RUN_ATTEMPT}.xlsx"
           "REPORT_PATH=$output" >> $env:GITHUB_ENV
-          $crawlArgs = @('mvno_combined_edge_v50.py', '--date', $env:RUN_DATE, '--output', $output)
+          $crawlArgs = @('mvno_combined_edge_v51.py', '--date', $env:RUN_DATE, '--output', $output)
           if (Test-Path 'history/latest.xlsx') {
             $crawlArgs += @('--previous', 'history/latest.xlsx')
           }
