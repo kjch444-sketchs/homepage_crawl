@@ -89,7 +89,7 @@ def send_mail(report, sections):
     message = EmailMessage()
     message["From"] = sender
     message["To"] = os.environ["MVNO_MAIL_TO"]
-    message["Subject"] = f"MVNO 가이드위반 보고 {report.stem}"
+    message["Subject"] = f"홈페이지 가이드위반 보고 {report.stem}"
     message.set_content("가이드위반 시트의 내용은 HTML 메일 본문 및 첨부 엑셀을 확인하세요.")
     message.add_alternative(email_body(sections, report), subtype="html")
     message.add_attachment(report.read_bytes(), maintype="application",
