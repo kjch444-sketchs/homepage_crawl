@@ -30,7 +30,7 @@ jobs:
           python-version: '3.13'
 
       - name: 의존성 설치
-        run: python -m pip install playwright openpyxl
+        run: python -m pip install playwright openpyxl beautifulsoup4
 
       - name: 한국 시간 실행 ID 설정
         shell: pwsh
