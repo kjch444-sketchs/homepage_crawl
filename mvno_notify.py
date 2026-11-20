@@ -7,6 +7,7 @@ import os
 import smtplib
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -83,13 +84,22 @@ def required(*names):
         raise RuntimeError("GitHub Actions Secret 누락: " + ", ".join(missing))
 
 
+def mail_subject():
+    run_stamp = os.environ.get("RUN_STAMP", "")
+    try:
+        started_kst = datetime.strptime(run_stamp, "%Y%m%d_%H%M%S")
+    except ValueError:
+        started_kst = datetime.now(timezone(timedelta(hours=9)))
+    return f"{started_kst:%Y%m%d}_{started_kst:%H}시{started_kst:%M}분_홈페이지_크롤링데이터"
+
+
 def send_mail(report, sections):
     required("GMAIL_ADDRESS", "GMAIL_APP_PASSWORD", "MVNO_MAIL_TO")
     sender = os.environ["GMAIL_ADDRESS"]
     message = EmailMessage()
     message["From"] = sender
     message["To"] = os.environ["MVNO_MAIL_TO"]
-    message["Subject"] = f"홈페이지 가이드위반 보고 {report.stem}"
+    message["Subject"] = mail_subject()
     message.set_content("가이드위반 시트의 내용은 HTML 메일 본문 및 첨부 엑셀을 확인하세요.")
     message.add_alternative(email_body(sections, report), subtype="html")
     message.add_attachment(report.read_bytes(), maintype="application",
