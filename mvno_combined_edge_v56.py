@@ -1495,7 +1495,7 @@ def write_report(rows, template, previous, output):
                       ("통화 제공량", "문자 제공량", "데이터 제공량"))
         is_rs = reference.get(key) == "RS"
         ws.cell(index, 13,
-                f'=IFERROR(VLOOKUP($C{index}&$D{index}&$E{index},참조!$B:$G,6,0),"")')
+                f'=IFERROR(IF(EXACT(TRIM(VLOOKUP($C{index}&$D{index}&$E{index},참조!$B:$G,6,0)&""),"RS"),"RS","RM"),"RM")')
         violation = rule_for(row, is_rs)
         ws.cell(index, 14, violation)
         if violation:
