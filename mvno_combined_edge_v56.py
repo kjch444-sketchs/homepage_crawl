@@ -9,10 +9,13 @@ import time
 from mvno_easy import crawl_easy
 from mvno_shake import crawl_shake
 from collections import Counter, defaultdict
+from copy import copy
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from openpyxl import Workbook, load_workbook
+from openpyxl.formula.translate import Translator
 from openpyxl.styles import PatternFill
+from openpyxl.utils.cell import range_boundaries
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
 FREET_URL = "https://www.freet.co.kr/plan/ratePlan"
@@ -1414,6 +1417,53 @@ def rule_for(row, rs):
     return ", ".join(reasons)
 
 
+def capture_homepage_calculations(ws):
+    """Remember formulas in O:R before the report writer clears old rows."""
+    formulas = {}
+    special_columns = set()
+    tables = tuple(range_boundaries(table.ref) for table in ws.tables.values())
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=15, max_col=18):
+        for cell in row:
+            if cell.data_type != "f":
+                continue
+            formulas[cell.row, cell.column] = (copy(cell.value), copy(cell._style))
+            # Array/data-table formulas own a range (potentially spilling across
+            # another output column). Keep the anchor but never fill over it.
+            if not isinstance(cell.value, str):
+                special_columns.add(cell.column)
+                if getattr(cell.value, "ref", None):
+                    first, _, last, _ = range_boundaries(cell.value.ref)
+                    special_columns.update(range(max(15, first), min(18, last) + 1))
+    return formulas, special_columns, tables
+
+
+def restore_homepage_calculations(ws, captured, last_row):
+    """Restore existing rows exactly and extend ordinary formulas only at the end."""
+    formulas, special_columns, tables = captured
+    seeds = {}
+    for (row, col), (formula, style) in formulas.items():
+        seeds[col] = row
+        if row <= last_row:
+            cell = ws.cell(row, col)
+            cell.value, cell._style = formula, style
+    for col, seed_row in seeds.items():
+        if col in special_columns or seed_row >= last_row:
+            continue
+        seed = ws.cell(seed_row, col)
+        # Do not write a table's calculated-column formula outside its table.
+        # In-table formulas are restored exactly; resizing tables is not needed
+        # for ordinary O:R formulas and would alter existing workbook semantics.
+        ceiling = last_row
+        for left, top, right, bottom in tables:
+            if left <= col <= right and top < seed.row <= bottom:
+                ceiling = min(ceiling, bottom)
+        translator = Translator(seed.value, origin=seed.coordinate)
+        for row in range(seed.row + 1, ceiling + 1):
+            cell = ws.cell(row, col)
+            cell.value = translator.translate_formula(cell.coordinate)
+            cell._style = copy(seed._style)
+
+
 def write_report(rows, template, previous, output):
     prepaid_count = sum(is_prepaid(row) for row in rows)
     if prepaid_count:
@@ -1430,6 +1480,7 @@ def write_report(rows, template, previous, output):
         if any(value is not None for value in (voice, message, data))
     }
     ws = book["홈페이지"]
+    preserved_calculations = capture_homepage_calculations(ws)
     if ws.max_row > 1:
         ws.delete_rows(2, ws.max_row - 1)
     for col, label in enumerate([*COLUMNS, "RS구분", "가이드위반"], 1):
@@ -1450,6 +1501,7 @@ def write_report(rows, template, previous, output):
         if violation:
             ws.cell(index, 14).fill = highlight
             (rs_violations if is_rs else rm_violations).append(row)
+    restore_homepage_calculations(ws, preserved_calculations, len(rows) + 1)
     ws.auto_filter.ref = f"A1:N{max(1, len(rows) + 1)}"
     ws.freeze_panes = "A2"
     ws.column_dimensions["N"].width = 32
