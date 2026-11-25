@@ -184,37 +184,79 @@ def _date_label(stamp):
         return None
 
 
+def _company_names(values):
+    return {normalized(value): label(value) for value in sorted(values) if normalized(value)}
+
+
+def _comparison_scope(old_providers, current_providers, old_failed, current_failed, prior_diagnostics):
+    """Use the same verified carrier cohort on both sides, independent of coverage errors."""
+    old, current = _company_names(old_providers), _company_names(current_providers)
+    old_errors, current_errors = _company_names(old_failed), _company_names(current_failed)
+    kg = normalized(KG_PROVIDER)
+    unknown_kg = prior_diagnostics is None and kg in old and kg not in old_errors
+    unavailable = set(old_errors) | set(current_errors)
+    if unknown_kg:
+        unavailable.add(kg)
+    common = (set(old) & set(current)) - unavailable
+    old_missing = [current[key] for key in set(current) - set(old) - unavailable]
+    new_missing = [old[key] for key in set(old) - set(current) - unavailable]
+    details = []
+    for reason, names in (
+        ("직전 수집 오류", old_errors.values()), ("이번 수집 오류", current_errors.values()),
+        ("직전 결과 없음", old_missing), ("이번 결과 없음", new_missing),
+    ):
+        if names:
+            details.append(reason + ": " + ", ".join(sorted(names)))
+    if unknown_kg:
+        details.append("직전 상세 수집 상태 미확인: " + KG_PROVIDER)
+    if details:
+        note = (f"두 회차의 공통 확인 사업자 {len(common)}곳 기준입니다. "
+                "아래에 표시된 사업자는 두 회차 모두에서 빼므로 전체 시장의 최저가 변화가 아닙니다. "
+                "제외 사유: " + " / ".join(details) + ". ")
+    else:
+        note = f"두 회차의 공통 확인 사업자 {len(common)}곳 기준입니다. " if common else ""
+    old_allowed = {name for name in old_providers if normalized(name) in common}
+    current_allowed = {name for name in current_providers if normalized(name) in common}
+    return old_allowed, current_allowed, note
+
+
 def build_mail_change(current, previous, lowest_fn, stamp=None, previous_stamp=None,
                       current_diagnostics=()):
-    """Compare one actual prior run; never compare partial/ambiguous minima."""
+    """Compare the same complete carrier subset against one verified prior snapshot."""
     dates = _date_label(previous_stamp), _date_label(stamp)
     timeframe = f"비교 기준: {dates[0]} → {dates[1]} (한국시간). " if all(dates) else ""
     if previous is None or not previous.is_file():
         return {"note": "첫 회차이거나 직전 비교 파일이 없어 비교하지 않았습니다.", "rows": []}
+    scope = ""
     try:
-        current_rows, current_failed, current_invalid, current_providers, _ = lowest_fn(current, quality=True)
-        old_rows, old_failed, old_invalid, old_providers, prior_diagnostics = lowest_fn(previous, quality=True)
-        current_failed |= set(current_diagnostics)
+        current_rows, current_failed, current_invalid, current_providers, _, current_definitions = lowest_fn(current, quality=True)
+        old_rows, old_failed, old_invalid, old_providers, prior_diagnostics, old_definitions = lowest_fn(previous, quality=True)
+        old_allowed, current_allowed, scope = _comparison_scope(
+            old_providers, current_providers, old_failed, current_failed | set(current_diagnostics), prior_diagnostics
+        )
+        if not old_allowed or not current_allowed:
+            return {"note": timeframe + scope + "비교 가능한 공통 사업자가 없어 최저가 비교를 보류했습니다.", "rows": []}
+        if current_allowed != current_providers or old_allowed != old_providers:
+            # Filter before recomputing minima rather than removing winners after the fact.
+            old_rows, _, old_invalid, _, _, _ = lowest_fn(previous, quality=True, providers=old_allowed)
+            current_rows, _, current_invalid, _, _, _ = lowest_fn(current, quality=True, providers=current_allowed)
         before, now = _group_prices(old_rows), _group_prices(current_rows)
     except (OSError, KeyError, BadZipFile, InvalidFileException, ValueError):
-        return {"note": timeframe + "직전 회차·이번 회차의 비교 자료를 확인할 수 없어 보류했습니다.", "rows": []}
-    if current_failed or old_failed:
-        fail_info = []
-        if old_failed:
-            fail_info.append("직전: " + ", ".join(sorted(old_failed)))
-        if current_failed:
-            fail_info.append("이번: " + ", ".join(sorted(current_failed)))
-        return {"note": timeframe + "수집 오류로 최저가 변화를 확정하지 않았습니다. (" + " / ".join(fail_info) + ")", "rows": []}
-    if prior_diagnostics is None and KG_PROVIDER in old_providers:
-        return {"note": timeframe + "직전 회차의 KG모바일 상세 수집 상태를 검증할 수 없어 비교를 보류했습니다.", "rows": []}
-    if not current_providers or current_providers != old_providers:
-        return {"note": timeframe + "두 회차 수집 사업자 범위가 달라 최저가 비교를 보류했습니다.", "rows": []}
-    if set(before) != set(now):
-        return {"note": timeframe + "두 회차의 요금제군 정의가 달라 최저가 비교를 보류했습니다.", "rows": []}
-
+        return {"note": timeframe + scope + "직전 회차·이번 회차의 비교 자료를 확인할 수 없어 보류했습니다.", "rows": []}
+    # Do not compare same-named groups assembled from different reference specs;
+    # a remapped group is not evidence that its price changed.
+    order = dict.fromkeys([*now, *before])
+    remapped = [
+        group for group in order
+        if group not in before or group not in now
+        or old_definitions.get(group) != current_definitions.get(group)
+    ]
+    remapped_set = set(remapped)
     changes, withheld = [], []
     after_available = 0
     for group, (new_price, new_winners) in now.items():
+        if group in remapped_set:
+            continue
         old_price, old_winners = before[group]
         if group in current_invalid or group in old_invalid or (old_price is None) != (new_price is None):
             withheld.append(group)
@@ -230,13 +272,15 @@ def build_mail_change(current, previous, lowest_fn, stamp=None, previous_stamp=N
             amount = new_price - old_price
             change = f"{amount:+,}원" + (" · 최저가 사업자/망 변경" if new_winners != old_winners else "")
         changes.append((group, old_price, _winners(old_winners), new_price, _winners(new_winners), change))
-    note = timeframe
+    note = timeframe + scope
     if not changes:
         note += "비교 가능한 요금제군에서 최저가 및 동률 사업자·망 변경이 없습니다." if after_available else "비교 가능한 최저가 자료가 없습니다."
     else:
         note += f"비교 가능한 {after_available}개 군 중 {len(changes)}개 군에 변화가 있습니다."
     if withheld:
         note += f" 한쪽에서만 확인됐거나 가격·망 정보가 불완전한 {len(withheld)}개 군은 비교 보류: " + ", ".join(withheld) + "."
+    if remapped:
+        note += f" 참조 정의가 달라진 {len(remapped)}개 군은 비교 보류: " + ", ".join(remapped) + "."
     return {"note": note, "rows": changes}
 
 

@@ -9,7 +9,6 @@ import re
 import smtplib
 import urllib.parse
 import urllib.request
-from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from numbers import Real
@@ -90,7 +89,7 @@ def _render_daily_report(source, rs_rows, rm_rows, lowest_rows, attachment_name,
         f'<p style="color:#666;font-size:12px;">{html.escape(change_note)}</p>' if change_note else "",
         _mail_table("RS 요금제 가이드 위반", guide_headers, rs_rows),
         _mail_table("RM 요금제 가이드 위반", guide_headers, rm_rows),
-        _mail_table("요금제군별 최저가", ("요금제군", "사업자", "망정보", "월 요금(원)"), lowest_rows),
+        _mail_table("요금제군별 최저가", ("요금제군", "사업자·망", "월 요금(원)"), lowest_rows),
         f'<p style="color:#666;font-size:12px;">{html.escape(lowest_note)}</p>' if lowest_note else "",
         f'<p style="margin-top:28px;color:#666;">상세 내용은 첨부된 <b>{safe_name}</b> 파일을 확인해 주세요.</p>',
         '<p style="color:#888;font-size:12px;">이 메일은 자동으로 생성되었습니다.</p>',
@@ -112,95 +111,96 @@ def _high_data_capacity(value):
     return int(match.group(1)) if match else None
 
 
-def _high_data_lowest_rows(rows):
-    """Append four capacity groups, retaining all tied carriers and networks."""
-    best = {}
-    for data, carrier, network, price in rows:
-        capacity = _high_data_capacity(data)
-        if (capacity is None or not isinstance(price, Real) or isinstance(price, bool)
-                or not math.isfinite(price) or price < 0):
-            continue
-        identity = (str(carrier or "").strip(), str(network or "").strip())
-        if not all(identity):
-            continue
-        previous_price, winners = best.get(capacity, (math.inf, set()))
-        if price < previous_price:
-            best[capacity] = price, {identity}
-        elif price == previous_price:
-            winners.add(identity)
-    result = []
-    for capacity in HIGH_DATA_CAPACITIES:
-        label = f"{capacity}G"
-        if capacity not in best:
-            result.append([label, "해당 없음", "", None])
-            continue
-        price, winners = best[capacity]
-        result.extend([label, carrier, network, price] for carrier, network in sorted(winners))
-    return result
+def _canonical_group(value):
+    """Unify only G/GB and spacing, retaining user-defined qualifiers."""
+    name = clean_label(value)
+    match = re.fullmatch(r"(\d+)\s*G(?:B)?(?:\s*\+\s*(.+))?", name, re.IGNORECASE)
+    if not match:
+        return name
+    capacity, qualifier = match.groups()
+    return f"{capacity}GB" + (f" + {qualifier.strip()}" if qualifier else "")
 
 
-def lowest_price_rows(report, *, quality=False):
-    # The crawler's 참조 keys are the actual voice/text/data tuples in C:E.
-    # Never read the Excel formula cache: openpyxl does not recalculate it.
+def _reference_groups(wb):
+    mapping = {}
+    for _, _, voice, text, data, raw_group, category in wb["참조"].iter_rows(
+        min_row=3, max_col=7, values_only=True
+    ):
+        if data not in (None, ""):
+            # Excel VLOOKUP takes the first match. Retain explicit blanks/RM
+            # so a capacity guess cannot override a reference entry.
+            group = _canonical_group(raw_group) if clean_label(category) == "RS" else ""
+            mapping.setdefault((voice, text, data), group)
+    names = dict.fromkeys(group for group in mapping.values() if group)
+    extras = {cap: f"{cap}GB" for cap in HIGH_DATA_CAPACITIES if f"{cap}GB" not in names}
+    names.update(dict.fromkeys(extras.values()))
+    return mapping, names, extras
+
+
+def lowest_price_rows(report, *, quality=False, providers=None):
+    # Use actual Excel source values and never the uncalculated formula cache.
+    # Exact specifications select the reference label, but prices are ranked
+    # across ALL specifications with the same reference group label.
     wb = load_workbook(report, read_only=True, data_only=True)
     try:
-        categories = {}
-        for _, _, voice, text, data, label, category in wb["참조"].iter_rows(
-            min_row=3, max_col=7, values_only=True
-        ):
-            if data not in (None, ""):
-                categories[(voice, text, data)] = (label, category)
-        groups = {
-            key: label.strip() if isinstance(label, str) and label.strip()
-                 else f"{key[2]} / 통화 {key[0] or '-'} / 문자 {key[1] or '-'}"
-            for key, (label, category) in categories.items()
-            if str(category or "").strip() == "RS" and _high_data_capacity(key[2]) is None
-        }
-        # When a label is shared, keep the exact allowance groups distinguishable.
-        counts = Counter(groups.values())
-        for key, label in groups.items():
-            if counts[label] > 1:
-                groups[key] = f"{label} ({key[2]} / 통화 {key[0] or '-'} / 문자 {key[1] or '-'})"
-
+        mapping, names, extras = _reference_groups(wb)
         minimums = {}
-        high_data_rows = []
-        invalid, providers = set(), set()
+        invalid, found_providers = set(), set()
         for carrier, plan, voice, text, data, network, _, monthly in wb["홈페이지"].iter_rows(
             min_row=2, max_col=8, values_only=True
         ):
             key = (voice, text, data)
-            capacity = _high_data_capacity(data)
-            if capacity is not None:
-                high_data_rows.append((data, carrier, network, monthly))
-            if quality:
-                if clean_label(carrier) and clean_label(plan):
-                    providers.add(clean_label(carrier))
-                group = f"{capacity}G" if capacity is not None else groups.get(key)
-                if group and (not clean_label(carrier) or not clean_label(plan) or not clean_label(network) or not valid_price(monthly)):
-                    invalid.add(group)
-            if (key not in groups or not carrier or not network
-                    or not isinstance(monthly, Real) or isinstance(monthly, bool)
-                    or not math.isfinite(monthly) or monthly < 0):
+            carrier, plan, network = map(clean_label, (carrier, plan, network))
+            if quality and carrier and plan:
+                found_providers.add(carrier)
+            # A blank carrier cannot safely be excluded by coverage and still
+            # blocks comparison for its otherwise identifiable group.
+            if providers is not None and carrier and carrier not in providers:
                 continue
-            price, winners = minimums.get(key, (math.inf, set()))
-            identity = (str(carrier).strip(), str(network).strip())
-            if monthly < price:
-                minimums[key] = monthly, {identity}
-            elif monthly == price:
+            group = mapping[key] if key in mapping else extras.get(_high_data_capacity(data))
+            if not group:
+                continue
+            if not carrier or not plan or not network or not valid_price(monthly):
+                if quality:
+                    invalid.add(group)
+                continue
+            previous_price, winners = minimums.get(group, (math.inf, set()))
+            identity = (carrier, network)
+            if monthly < previous_price:
+                minimums[group] = monthly, {identity}
+            elif monthly == previous_price:
                 winners.add(identity)
         rows = []
-        for key, name in groups.items():
-            if key not in minimums:
-                rows.append((name, "해당 없음", "", None))
+        for group in names:
+            if group not in minimums:
+                rows.append((group, "해당 없음", "", None))
                 continue
-            amount, winners = minimums[key]
-            rows.extend((name, carrier, network, amount) for carrier, network in sorted(winners))
-        rows.extend(_high_data_lowest_rows(high_data_rows))
+            amount, winners = minimums[group]
+            rows.extend((group, carrier, network, amount) for carrier, network in sorted(winners))
         failures = failed_providers(wb)
-        return ((rows, failures, invalid, providers, recorded_diagnostic_status(wb))
-                if quality else (rows, bool(failures)))
+        if not quality:
+            return rows, bool(failures)
+        definitions = {group: set() for group in names}
+        for key, group in mapping.items():
+            if group:
+                definitions[group].add(key)
+        for capacity, group in extras.items():
+            definitions[group].add(("high-fallback", capacity))
+        return (rows, failures, invalid, found_providers, recorded_diagnostic_status(wb),
+                {group: frozenset(keys) for group, keys in definitions.items()})
     finally:
         wb.close()
+
+
+def _compact_lowest_rows(rows):
+    """Keep one visible mail row per group and retain each carrier/network pair."""
+    groups = {}
+    for group, carrier, network, amount in rows:
+        price, winners = groups.setdefault(group, (amount, []))
+        if network:
+            winners.append(f"{carrier} ({network})")
+    return [(group, ", ".join(winners) if winners else "해당 없음", price)
+            for group, (price, winners) in groups.items()]
 
 
 def email_body(sections, report, attachment_name):
@@ -210,13 +210,13 @@ def email_body(sections, report, attachment_name):
         for label in ("RS", "RM")
     }
     lowest_rows, partial = lowest_price_rows(report)
-    note = ("참조 시트에서 RS로 지정한 요금제군의 월 요금 기준입니다. "
-            "95G·125G·150G·180G는 RS/RM과 관계없이 월 요금 기준입니다.")
+    note = ("참조 시트에 지정한 이름으로 묶은 요금제군별 월 요금입니다. "
+            "동률인 사업자와 망은 모두 표시합니다.")
     if partial:
         note += " 수집된 행의 잠정 최저가이며, 수집 누락으로 실제 최저가·동률이 다를 수 있습니다."
     change_note, change_rows = read_mail_change(report)
     return _render_daily_report(
-        "홈페이지", guide_rows["RS"], guide_rows["RM"], lowest_rows, attachment_name, note,
+        "홈페이지", guide_rows["RS"], guide_rows["RM"], _compact_lowest_rows(lowest_rows), attachment_name, note,
         change_note, change_rows
     )
 
