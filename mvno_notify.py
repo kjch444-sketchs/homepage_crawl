@@ -5,6 +5,7 @@ import html
 import json
 import math
 import os
+import re
 import smtplib
 import urllib.parse
 import urllib.request
@@ -87,6 +88,47 @@ def _render_daily_report(source, rs_rows, rm_rows, lowest_rows, attachment_name,
     ])
 
 
+HIGH_DATA_CAPACITIES = (95, 125, 150, 180)
+_HIGH_DATA_RE = re.compile(
+    r"^\s*(?:월\s*)?(95|125|150|180)\s*(?:GB|G|기가바이트|기가)"
+    r"(?![a-z0-9]|\s*(?:/\s*일|매일))",
+    re.IGNORECASE,
+)
+
+
+def _high_data_capacity(value):
+    """Match the base monthly allowance, not a daily/add-on amount or plan name."""
+    match = _HIGH_DATA_RE.match(str(value))
+    return int(match.group(1)) if match else None
+
+
+def _high_data_lowest_rows(rows):
+    """Append four capacity groups, retaining all tied carriers and networks."""
+    best = {}
+    for data, carrier, network, price in rows:
+        capacity = _high_data_capacity(data)
+        if (capacity is None or not isinstance(price, Real) or isinstance(price, bool)
+                or not math.isfinite(price) or price < 0):
+            continue
+        identity = (str(carrier or "").strip(), str(network or "").strip())
+        if not all(identity):
+            continue
+        previous_price, winners = best.get(capacity, (math.inf, set()))
+        if price < previous_price:
+            best[capacity] = price, {identity}
+        elif price == previous_price:
+            winners.add(identity)
+    result = []
+    for capacity in HIGH_DATA_CAPACITIES:
+        label = f"{capacity}G"
+        if capacity not in best:
+            result.append([label, "해당 없음", "", None])
+            continue
+        price, winners = best[capacity]
+        result.extend([label, carrier, network, price] for carrier, network in sorted(winners))
+    return result
+
+
 def lowest_price_rows(report):
     # The crawler's 참조 keys are the actual voice/text/data tuples in C:E.
     # Never read the Excel formula cache: openpyxl does not recalculate it.
@@ -102,7 +144,7 @@ def lowest_price_rows(report):
             key: label.strip() if isinstance(label, str) and label.strip()
                  else f"{key[2]} / 통화 {key[0] or '-'} / 문자 {key[1] or '-'}"
             for key, (label, category) in categories.items()
-            if str(category or "").strip() == "RS"
+            if str(category or "").strip() == "RS" and _high_data_capacity(key[2]) is None
         }
         # When a label is shared, keep the exact allowance groups distinguishable.
         counts = Counter(groups.values())
@@ -111,10 +153,13 @@ def lowest_price_rows(report):
                 groups[key] = f"{label} ({key[2]} / 통화 {key[0] or '-'} / 문자 {key[1] or '-'})"
 
         minimums = {}
+        high_data_rows = []
         for carrier, _, voice, text, data, network, _, monthly in wb["홈페이지"].iter_rows(
             min_row=2, max_col=8, values_only=True
         ):
             key = (voice, text, data)
+            if _high_data_capacity(data) is not None:
+                high_data_rows.append((data, carrier, network, monthly))
             if (key not in groups or not carrier or not network
                     or not isinstance(monthly, Real) or isinstance(monthly, bool)
                     or not math.isfinite(monthly) or monthly < 0):
@@ -132,6 +177,7 @@ def lowest_price_rows(report):
                 continue
             amount, winners = minimums[key]
             rows.extend((name, carrier, network, amount) for carrier, network in sorted(winners))
+        rows.extend(_high_data_lowest_rows(high_data_rows))
         partial = "수집 오류" in wb.sheetnames and any(
             row[0] for row in wb["수집 오류"].iter_rows(min_row=2, max_col=1, values_only=True)
         )
@@ -147,7 +193,8 @@ def email_body(sections, report, attachment_name):
         for label in ("RS", "RM")
     }
     lowest_rows, partial = lowest_price_rows(report)
-    note = "참조 시트에서 RS로 지정한 요금제군의 월 요금 기준입니다."
+    note = ("참조 시트에서 RS로 지정한 요금제군의 월 요금 기준입니다. "
+            "95G·125G·150G·180G는 RS/RM과 관계없이 월 요금 기준입니다.")
     if partial:
         note += " 일부 사업자는 수집에 실패하여 성공한 데이터만 비교했습니다."
     return _render_daily_report(
