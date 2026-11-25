@@ -3,12 +3,15 @@
 import argparse
 import html
 import json
+import math
 import os
 import smtplib
 import urllib.parse
 import urllib.request
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from numbers import Real
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -35,23 +38,121 @@ def guide_sections(report):
         wb.close()
 
 
-def email_body(sections, report):
-    title = html.escape(report.stem)
-    blocks = [f"<h2>MVNO 요금제 가이드 위반 — {title}</h2>"]
-    for section in sections:
-        rows = section["rows"]
-        blocks.append(f"<h3>{html.escape(section['title'])}: {len(rows)}건</h3>")
-        blocks.append(f"<p style='white-space:pre-line'>{html.escape(section['rule'])}</p>")
-        blocks.append("<table border='1' cellspacing='0' cellpadding='5'><thead><tr>"
-                      + "".join(f"<th>{html.escape(s)}</th>" for s in
-                                ("순번", "사업자", "요금제 명", "월 요금", "할인 기간", "기간 이후 요금"))
-                      + "</tr></thead><tbody>")
-        for row in rows:
-            blocks.append("<tr>" + "".join(f"<td>{html.escape(str(v if v is not None else ''))}</td>"
-                                             for v in row) + "</tr>")
-        blocks.append("</tbody></table>")
-    blocks.append("<p>전체 요금제 및 전일 대비 변동은 첨부 엑셀을 확인하세요.</p>")
-    return "\n".join(blocks)
+def _mail_table(title, headers, rows):
+    def cell(value):
+        if value is None:
+            return "", "left"
+        if isinstance(value, Real) and not isinstance(value, bool):
+            if not math.isfinite(value):
+                return "", "left"
+            number = int(value) if float(value).is_integer() else value
+            return html.escape(f"{number:,}"), "right"
+        return html.escape(str(value)), "left"
+
+    parts = [
+        f'<h3 style="margin:24px 0 8px;color:#1F4E78;">{html.escape(title)}</h3>',
+        '<table style="border-collapse:collapse;width:100%;font-family:Arial,Malgun Gothic,sans-serif;font-size:13px;">',
+        '<tr>',
+    ]
+    for header in headers:
+        parts.append(f'<th style="border:1px solid #cfd8e3;background:#D9EAF7;padding:7px;text-align:center;">{html.escape(header)}</th>')
+    parts.append("</tr>")
+    if not rows:
+        parts.append(f'<tr><td colspan="{len(headers)}" style="border:1px solid #cfd8e3;padding:8px;text-align:center;color:#666;">해당 없음</td></tr>')
+    for row in rows:
+        parts.append("<tr>")
+        for value in row:
+            escaped, align = cell(value)
+            parts.append(f'<td style="border:1px solid #cfd8e3;padding:7px;text-align:{align};vertical-align:top;">{escaped}</td>')
+        parts.append("</tr>")
+    return "".join(parts) + "</table>"
+
+
+def _render_daily_report(source, rs_rows, rm_rows, lowest_rows, attachment_name, lowest_note=""):
+    guide_headers = ("사업자", "요금제 명", "월 요금", "할인 기간", "기간 이후 요금")
+    intro = "자동 크롤링 및 가이드 점검 결과입니다."
+    safe_name = html.escape(attachment_name)
+    return "".join([
+        '<!doctype html><html><body style="font-family:Arial,Malgun Gothic,sans-serif;color:#222;line-height:1.5;">',
+        '<div style="max-width:1400px;margin:0 auto;">',
+        f'<h2 style="color:#17365D;margin-bottom:4px;">{html.escape(source)} 요금제 Daily Report</h2>',
+        f'<p style="color:#666;margin-top:0;">{intro}</p>',
+        _mail_table("RS 요금제 가이드 위반", guide_headers, rs_rows),
+        _mail_table("RM 요금제 가이드 위반", guide_headers, rm_rows),
+        _mail_table("요금제군별 최저가", ("요금제군", "사업자", "망정보", "월 요금(원)"), lowest_rows),
+        f'<p style="color:#666;font-size:12px;">{html.escape(lowest_note)}</p>' if lowest_note else "",
+        f'<p style="margin-top:28px;color:#666;">상세 내용은 첨부된 <b>{safe_name}</b> 파일을 확인해 주세요.</p>',
+        '<p style="color:#888;font-size:12px;">이 메일은 자동으로 생성되었습니다.</p>',
+        '</div></body></html>',
+    ])
+
+
+def lowest_price_rows(report):
+    # The crawler's 참조 keys are the actual voice/text/data tuples in C:E.
+    # Never read the Excel formula cache: openpyxl does not recalculate it.
+    wb = load_workbook(report, read_only=True, data_only=True)
+    try:
+        categories = {}
+        for _, _, voice, text, data, label, category in wb["참조"].iter_rows(
+            min_row=3, max_col=7, values_only=True
+        ):
+            if data not in (None, ""):
+                categories[(voice, text, data)] = (label, category)
+        groups = {
+            key: label.strip() if isinstance(label, str) and label.strip()
+                 else f"{key[2]} / 통화 {key[0] or '-'} / 문자 {key[1] or '-'}"
+            for key, (label, category) in categories.items()
+            if str(category or "").strip() == "RS"
+        }
+        # When a label is shared, keep the exact allowance groups distinguishable.
+        counts = Counter(groups.values())
+        for key, label in groups.items():
+            if counts[label] > 1:
+                groups[key] = f"{label} ({key[2]} / 통화 {key[0] or '-'} / 문자 {key[1] or '-'})"
+
+        minimums = {}
+        for carrier, _, voice, text, data, network, _, monthly in wb["홈페이지"].iter_rows(
+            min_row=2, max_col=8, values_only=True
+        ):
+            key = (voice, text, data)
+            if (key not in groups or not carrier or not network
+                    or not isinstance(monthly, Real) or isinstance(monthly, bool)
+                    or not math.isfinite(monthly) or monthly < 0):
+                continue
+            price, winners = minimums.get(key, (math.inf, set()))
+            identity = (str(carrier).strip(), str(network).strip())
+            if monthly < price:
+                minimums[key] = monthly, {identity}
+            elif monthly == price:
+                winners.add(identity)
+        rows = []
+        for key, name in groups.items():
+            if key not in minimums:
+                rows.append((name, "해당 없음", "", None))
+                continue
+            amount, winners = minimums[key]
+            rows.extend((name, carrier, network, amount) for carrier, network in sorted(winners))
+        partial = "수집 오류" in wb.sheetnames and any(
+            row[0] for row in wb["수집 오류"].iter_rows(min_row=2, max_col=1, values_only=True)
+        )
+        return rows, partial
+    finally:
+        wb.close()
+
+
+def email_body(sections, report, attachment_name):
+    guide_rows = {
+        label: [row[1:] for section in sections if f" {label} " in section["title"]
+                for row in section["rows"]]
+        for label in ("RS", "RM")
+    }
+    lowest_rows, partial = lowest_price_rows(report)
+    note = "참조 시트에서 RS로 지정한 요금제군의 월 요금 기준입니다."
+    if partial:
+        note += " 일부 사업자는 수집에 실패하여 성공한 데이터만 비교했습니다."
+    return _render_daily_report(
+        "홈페이지", guide_rows["RS"], guide_rows["RM"], lowest_rows, attachment_name, note
+    )
 
 
 def telegram_messages(sections, report):
@@ -100,11 +201,12 @@ def send_mail(report, sections):
     message["From"] = sender
     message["To"] = os.environ["MVNO_MAIL_TO"]
     message["Subject"] = mail_subject()
-    message.set_content("가이드위반 시트의 내용은 HTML 메일 본문 및 첨부 엑셀을 확인하세요.")
-    message.add_alternative(email_body(sections, report), subtype="html")
+    attachment_name = f"{message['Subject']}.xlsx"
+    message.set_content("가이드 위반 및 요금제군별 최저가는 HTML 메일 본문과 첨부 엑셀을 확인하세요.")
+    message.add_alternative(email_body(sections, report, attachment_name), subtype="html")
     message.add_attachment(report.read_bytes(), maintype="application",
                            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           filename=report.name)
+                           filename=attachment_name)
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=60) as smtp:
         smtp.login(sender, os.environ["GMAIL_APP_PASSWORD"].replace(" ", ""))
         smtp.send_message(message)
