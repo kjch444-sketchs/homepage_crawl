@@ -17,6 +17,11 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
+from mvno_price_analysis import (
+    MAIL_BLOCK, failed_providers, label as clean_label, read_mail_change,
+    recorded_diagnostic_status, valid_price,
+)
+
 
 def guide_sections(report):
     wb = load_workbook(report, read_only=True, data_only=True)
@@ -69,7 +74,8 @@ def _mail_table(title, headers, rows):
     return "".join(parts) + "</table>"
 
 
-def _render_daily_report(source, rs_rows, rm_rows, lowest_rows, attachment_name, lowest_note=""):
+def _render_daily_report(source, rs_rows, rm_rows, lowest_rows, attachment_name, lowest_note="",
+                         change_note="", change_rows=()):
     guide_headers = ("사업자", "요금제 명", "월 요금", "할인 기간", "기간 이후 요금")
     intro = "자동 크롤링 및 가이드 점검 결과입니다."
     safe_name = html.escape(attachment_name)
@@ -78,6 +84,10 @@ def _render_daily_report(source, rs_rows, rm_rows, lowest_rows, attachment_name,
         '<div style="max-width:1400px;margin:0 auto;">',
         f'<h2 style="color:#17365D;margin-bottom:4px;">{html.escape(source)} 요금제 Daily Report</h2>',
         f'<p style="color:#666;margin-top:0;">{intro}</p>',
+        (_mail_table(MAIL_BLOCK, ("요금제군", "직전 최저가(원)", "직전 최저가 사업자·망",
+                                   "이번 최저가(원)", "이번 최저가 사업자·망", "변화"), change_rows)
+         if change_rows else f'<h3 style="margin:24px 0 8px;color:#1F4E78;">{MAIL_BLOCK}</h3>'),
+        f'<p style="color:#666;font-size:12px;">{html.escape(change_note)}</p>' if change_note else "",
         _mail_table("RS 요금제 가이드 위반", guide_headers, rs_rows),
         _mail_table("RM 요금제 가이드 위반", guide_headers, rm_rows),
         _mail_table("요금제군별 최저가", ("요금제군", "사업자", "망정보", "월 요금(원)"), lowest_rows),
@@ -129,7 +139,7 @@ def _high_data_lowest_rows(rows):
     return result
 
 
-def lowest_price_rows(report):
+def lowest_price_rows(report, *, quality=False):
     # The crawler's 참조 keys are the actual voice/text/data tuples in C:E.
     # Never read the Excel formula cache: openpyxl does not recalculate it.
     wb = load_workbook(report, read_only=True, data_only=True)
@@ -154,12 +164,20 @@ def lowest_price_rows(report):
 
         minimums = {}
         high_data_rows = []
-        for carrier, _, voice, text, data, network, _, monthly in wb["홈페이지"].iter_rows(
+        invalid, providers = set(), set()
+        for carrier, plan, voice, text, data, network, _, monthly in wb["홈페이지"].iter_rows(
             min_row=2, max_col=8, values_only=True
         ):
             key = (voice, text, data)
-            if _high_data_capacity(data) is not None:
+            capacity = _high_data_capacity(data)
+            if capacity is not None:
                 high_data_rows.append((data, carrier, network, monthly))
+            if quality:
+                if clean_label(carrier) and clean_label(plan):
+                    providers.add(clean_label(carrier))
+                group = f"{capacity}G" if capacity is not None else groups.get(key)
+                if group and (not clean_label(carrier) or not clean_label(plan) or not clean_label(network) or not valid_price(monthly)):
+                    invalid.add(group)
             if (key not in groups or not carrier or not network
                     or not isinstance(monthly, Real) or isinstance(monthly, bool)
                     or not math.isfinite(monthly) or monthly < 0):
@@ -178,10 +196,9 @@ def lowest_price_rows(report):
             amount, winners = minimums[key]
             rows.extend((name, carrier, network, amount) for carrier, network in sorted(winners))
         rows.extend(_high_data_lowest_rows(high_data_rows))
-        partial = "수집 오류" in wb.sheetnames and any(
-            row[0] for row in wb["수집 오류"].iter_rows(min_row=2, max_col=1, values_only=True)
-        )
-        return rows, partial
+        failures = failed_providers(wb)
+        return ((rows, failures, invalid, providers, recorded_diagnostic_status(wb))
+                if quality else (rows, bool(failures)))
     finally:
         wb.close()
 
@@ -196,9 +213,11 @@ def email_body(sections, report, attachment_name):
     note = ("참조 시트에서 RS로 지정한 요금제군의 월 요금 기준입니다. "
             "95G·125G·150G·180G는 RS/RM과 관계없이 월 요금 기준입니다.")
     if partial:
-        note += " 일부 사업자는 수집에 실패하여 성공한 데이터만 비교했습니다."
+        note += " 수집된 행의 잠정 최저가이며, 수집 누락으로 실제 최저가·동률이 다를 수 있습니다."
+    change_note, change_rows = read_mail_change(report)
     return _render_daily_report(
-        "홈페이지", guide_rows["RS"], guide_rows["RM"], lowest_rows, attachment_name, note
+        "홈페이지", guide_rows["RS"], guide_rows["RM"], lowest_rows, attachment_name, note,
+        change_note, change_rows
     )
 
 
