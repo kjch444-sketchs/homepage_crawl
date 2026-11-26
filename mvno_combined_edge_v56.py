@@ -734,7 +734,7 @@ def eyes_card(card):
 
 def crawl_eyes(page, output_rows):
     page.goto(EYES_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_selector(".plancard_list a.plan_card.full", timeout=30000)
+    page.wait_for_selector(".plancard_list a.plan_card.full", timeout=45000)
     expected = num(page.locator(".filter_apply_box .tot_cnt").first.inner_text())
     if not expected:
         raise RuntimeError("아이즈비전 전체 요금제 수를 읽지 못했습니다")
@@ -749,7 +749,7 @@ def crawl_eyes(page, output_rows):
                 try:
                     page.goto(f"https://www.eyes.co.kr//payplan/all_plan//?&page={page_no}",
                               wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_selector(".plancard_list a.plan_card.full", timeout=30000)
+                    page.wait_for_selector(".plancard_list a.plan_card.full", timeout=45000)
                     active_page = clean(page.locator(".list_footer.paging button.pagenation.active").first.inner_text())
                     if active_page != str(page_no):
                         raise RuntimeError(f"요청 {page_no}페이지, 실제 표시 {active_page}페이지")
@@ -757,6 +757,9 @@ def crawl_eyes(page, output_rows):
                 except Exception as exc:
                     errors.append(f"{attempt}차: {str(exc).splitlines()[0]}")
                     print(f"아이즈비전 {page_no}페이지 로딩 재시도 {attempt}/3: {errors[-1]}")
+                    if attempt < 3:
+                        # 목록 API 응답 지연이 풀릴 시간을 주고 다음 시도를 한다.
+                        page.wait_for_timeout(5000 * attempt)
             else:
                 raise RuntimeError(
                     f"아이즈비전 {page_no}/{total_pages}페이지 로딩 실패 "
